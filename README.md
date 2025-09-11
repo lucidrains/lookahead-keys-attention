@@ -2,7 +2,7 @@
 
 Causal Attention with [Lookahead Keys](https://arxiv.org/abs/2509.07301)
 
-## citations
+## Citations
 
 ```bibtex
 @inproceedings{Song2025CausalAW,
