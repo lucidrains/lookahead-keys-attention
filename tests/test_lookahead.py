@@ -16,8 +16,9 @@ def test_castle():
     seq_len = 8
     dim = 32
     dim_head = 16
+    heads = 2
 
-    model = ParallelSlowCastle(dim=dim, dim_head=dim_head)
+    model = ParallelSlowCastle(dim=dim, dim_head=dim_head, heads=heads)
     model.eval()
 
     input_sequence = torch.randn(batch_size, seq_len, dim)
@@ -27,12 +28,14 @@ def test_castle():
     with torch.no_grad():
         for t in range(seq_len):
             x_t = input_sequence[:, t:t+1, :]
-            output_t, cache = model.forward_inference(x_t, cache)
+            
+            output_t, cache = model.forward(x_t, cache=cache)
             recurrent_outputs.append(output_t)
 
-    final_recurrent_output = torch.cat(recurrent_outputs, dim = 1)
+    final_recurrent_output = torch.cat(recurrent_outputs, dim=1)
 
     with torch.no_grad():
-        output_parallel = model(input_sequence)
+        output_parallel, _ = model.forward(input_sequence)
 
-    assert torch.allclose(final_recurrent_output, output_parallel, atol = 1e-6)
+    assert final_recurrent_output.shape == output_parallel.shape
+    assert torch.allclose(final_recurrent_output, output_parallel, atol=1e-6)
