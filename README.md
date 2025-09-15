@@ -1,4 +1,4 @@
-## Lookahead Keys Attention
+## Lookahead Keys Attention (wip)
 
 Causal Attention with [Lookahead Keys](https://arxiv.org/abs/2509.07301)
 
