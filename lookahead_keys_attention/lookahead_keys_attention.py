@@ -45,14 +45,9 @@ class ParallelSlowCastle(Module):
 
         self.scale = dim_head ** -0.5
 
-        self.w_q_u = LinearNoBias(dim, dim_inner)
-        self.w_k_u = LinearNoBias(dim, dim_inner)
-        self.w_v_u = LinearNoBias(dim, dim_inner)
-        self.w_q_c = LinearNoBias(dim, dim_inner)
-        self.w_k_c = LinearNoBias(dim, dim_inner)
-        self.w_v_c = LinearNoBias(dim, dim_inner)
+        self.to_all_qkv = LinearNoBias(dim, dim_inner * 6)
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_heads = Rearrange('b n (qkv h d) -> qkv b h n d', qkv = 6, h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.combine_heads = LinearNoBias(dim_inner, dim)
@@ -64,10 +59,9 @@ class ParallelSlowCastle(Module):
     ):
         batch_size, seq_len, device = *x.shape[:2], x.device
 
-        q_u, k_u, v_u = self.w_q_u(x), self.w_k_u(x), self.w_v_u(x)
-        q_c, k_c, v_c = self.w_q_c(x), self.w_k_c(x), self.w_v_c(x)
+        qkvs = self.to_all_qkv(x)
 
-        (q_u, k_u, v_u, q_c, k_c, v_c) = map(self.split_heads, (q_u, k_u, v_u, q_c, k_c, v_c))
+        q_u, k_u, v_u, q_c, k_c, v_c = self.split_heads(qkvs)
 
         is_inference = seq_len == 1
 
