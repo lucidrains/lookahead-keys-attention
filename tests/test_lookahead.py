@@ -2,24 +2,22 @@ import torch
 import pytest
 
 from lookahead_keys_attention.lookahead_keys_attention import (
-    LookaheadKeysAttention,
     ParallelSlowCastle
 )
 
-def test_lookahead_keys_attention_runs():
-    model = LookaheadKeysAttention()
-    x = torch.randn(2, 10, 64)
-    output = model(x)
-
-def test_castle():
-    batch_size = 1
+def test_naive_castle():
+    batch_size = 2
     seq_len = 8
     dim = 32
     dim_head = 16
     heads = 2
 
+    # define
+
     model = ParallelSlowCastle(dim=dim, dim_head=dim_head, heads=heads)
     model.eval()
+
+    # naive sequential
 
     input_sequence = torch.randn(batch_size, seq_len, dim)
 
@@ -34,8 +32,10 @@ def test_castle():
 
     final_recurrent_output = torch.cat(recurrent_outputs, dim=1)
 
+    # naive parallel
+
     with torch.no_grad():
-        output_parallel, _ = model.forward(input_sequence)
+        output_parallel = model.forward(input_sequence)
 
     assert final_recurrent_output.shape == output_parallel.shape
     assert torch.allclose(final_recurrent_output, output_parallel, atol=1e-6)

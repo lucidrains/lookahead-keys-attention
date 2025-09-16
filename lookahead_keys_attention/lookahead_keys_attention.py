@@ -1,9 +1,11 @@
 from __future__ import annotations
+
 from functools import partial
+from collections import namedtuple
 
 import torch
-from torch import nn, cat, einsum
 from torch.nn import Module
+from torch import nn, cat, sigmoid, einsum, inf
 from torch.autograd import Function
 import torch.nn.functional as F
 
@@ -13,6 +15,8 @@ from einops.layers.torch import Rearrange
 
 LinearNoBias = partial(nn.Linear, bias=False)
 
+Cache = namedtuple('Cache', ('U', 'qu_cache', 'kc_cache', 'vc_cache'))
+
 # helper functions
 
 def exists(val):
@@ -21,20 +25,14 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
-class LookaheadKeysAttention(Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, x):
-        return x
-
-# naive castle implementation with improved DRY forward method
+# naive castle implementation
 
 class ParallelSlowCastle(Module):
     def __init__(
         self,
         dim,
-        dim_head,
-        heads = 8
+        heads = 8,
+        dim_head = 64
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -55,66 +53,85 @@ class ParallelSlowCastle(Module):
     def forward(
         self,
         x,
-        cache: dict | None = None
+        cache: Cache | None = None
     ):
-        batch_size, seq_len, device = *x.shape[:2], x.device
+        batch_size, seq_len, scale, device = *x.shape[:2], self.scale, x.device
+        is_inference = seq_len == 1
+
+        # projection
 
         qkvs = self.to_all_qkv(x)
 
-        q_u, k_u, v_u, q_c, k_c, v_c = self.split_heads(qkvs)
+        # c - usual causal parameters
+        # u - lookup keys related
 
-        is_inference = seq_len == 1
+        qu, ku, vu, qc, kc, vc = self.split_heads(qkvs)
+
+        # scaled queries
+
+        qu_scaled = qu * scale
+        qc_scaled = qc * scale
+
+        # handle single token vs multiple ones differently
 
         if not is_inference:
+            mask_shape = (seq_len, seq_len)
 
-            causal_mask = torch.triu(torch.full((seq_len, seq_len), -torch.inf, device=device), diagonal=1)
-            lookahead_mask = torch.tril(torch.full((seq_len, seq_len), -torch.inf, device=device), diagonal=0)
-            binary_causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=device))
+            causal_mask = torch.triu(torch.full(mask_shape, -inf, device = device), 1)
+            lookahead_mask = torch.tril(torch.full(mask_shape, -inf, device = device), 0)
+            binary_causal_mask = torch.tril(torch.ones(mask_shape, device = device))
 
-            term1 = (einsum('...id,...jd->...ij', q_c, v_u) * self.scale) * binary_causal_mask
-            sigmoid_term = torch.sigmoid((einsum('...id,...jd->...ij', q_u, k_u) * self.scale) + lookahead_mask)
-            S_u = einsum('...ij,...kj->...ik', term1, sigmoid_term)
-            S_c = (einsum('...id,...jd->...ij', q_c, k_c) * self.scale) + causal_mask
+            term1 = einsum('...id, ...jd -> ...ij', qc_scaled, vu) * binary_causal_mask
+            sigmoid_term = sigmoid(einsum('...id, ...jd -> ...ij', qu_scaled, ku) + lookahead_mask)
+
+            Su = einsum('...ij, ...kj -> ...ik', term1, sigmoid_term)
+            Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc) + causal_mask
             
-            final_scores = S_c - F.silu(S_u)
-            
-            V_c_context = v_c
-            next_cache = None
+            scores = Sc - F.silu(Su)
+ 
+            next_cache = None # todo - make sure this can be returned, need to compute U_updated_prev here
 
         else:
 
             if not exists(cache):
-                shape = (batch_size, self.heads, 0, self.dim_head)
+                empty_tensor = qu[..., 0:0, :] # (batch, heads, 0, dim_head)
+                cache = (empty_tensor,) * 4
 
-                cache = dict(
-                    U = torch.empty(shape, device=device),
-                    Q_u = torch.empty(shape, device=device),
-                    K_c = torch.empty(shape, device=device),
-                    V_c = torch.empty(shape, device=device)
-                )
+            U_prev, qu_cache, kc_cache, vc_cache = cache
 
-            U_prev, Q_u_cache, K_c_prev, V_c_prev = cache['U'], cache['Q_u'], cache['K_c'], cache['V_c']
+            qu_cache_scaled = qu_cache * scale
 
-            update_weights = torch.sigmoid(torch.einsum('...id,...jd->...ij', Q_u_cache, k_u) * self.scale)
-            U_updated_prev = U_prev + (update_weights * v_u)
-            U_t = cat([U_updated_prev, torch.zeros_like(q_u)], dim=-2)
+            update_weights = einsum('...id, ...jd -> ...ij', qu_cache_scaled, ku).sigmoid()
+            U_updated_prev = U_prev + (update_weights * vu)
 
-            K_c_context = cat([K_c_prev, k_c], dim=-2)
-            V_c_context = cat([V_c_prev, v_c], dim=-2)
+            Ut = cat((U_updated_prev, torch.zeros_like(qu)), dim = -2)
 
-            s_t_c = einsum('...id,...jd->...ij', q_c, K_c_context) * self.scale
-            s_t_u = einsum('...id,...jd->...ij', q_c, U_t) * self.scale
-            final_scores = s_t_c - F.silu(s_t_u)
+            kc = cat((kc_cache, kc), dim = -2)
+            vc = cat((vc_cache, vc), dim = -2)
 
-            next_cache = dict(
-                U = U_t,
-                Q_u = cat([Q_u_cache, q_u], dim=-2),
-                K_c = K_c_context,
-                V_c = V_c_context
-            )
+            Stc = einsum('...id, ...jd->...ij', qc_scaled, kc)
+            Stu = einsum('...id, ...jd->...ij', qc_scaled, Ut)
 
-        attention_weights = F.softmax(final_scores, dim=-1)
-        output = einsum('...ij,...jd->...id', attention_weights, V_c_context)
+            scores = Stc - F.silu(Stu)
 
-        output = self.merge_heads(output)
-        return self.combine_heads(output), next_cache
+            next_qu = cat((qu_cache, qu), dim = -2)
+            next_cache = Cache(Ut, next_qu, kc, vc)
+
+        # attention
+
+        attn = scores.softmax(dim = -1)
+
+        # aggregate
+
+        out = einsum('...ij, ...jd -> ...id', attn, vc)
+
+        # merge and combine heads
+
+        out = self.merge_heads(out)
+
+        out = self.combine_heads(out)
+
+        if not is_inference:
+            return out
+
+        return out, next_cache
