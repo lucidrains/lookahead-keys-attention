@@ -5,7 +5,7 @@ from collections import namedtuple
 
 import torch
 from torch.nn import Module
-from torch import nn, cat, sigmoid, einsum, inf
+from torch import nn, cat, sigmoid, einsum
 from torch.autograd import Function
 import torch.nn.functional as F
 
@@ -24,6 +24,9 @@ def exists(val):
 
 def default(val, d):
     return val if exists(val) else d
+
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
 
 # naive castle implementation
 
@@ -83,25 +86,24 @@ class ParallelSlowCastle(Module):
             mask_shape = (seq_len, seq_len)
 
             causal_mask = torch.ones(mask_shape, device = device, dtype = torch.bool).triu(1)
-            lookahead_mask = torch.full(mask_shape, -inf, device = device).tril()
 
             term1 = einsum('...id, ...jd -> ...ij', qc_scaled, vu)
             term1 = term1.masked_fill(causal_mask, 0.)
 
             lookahead_sim = einsum('...id, ...jd -> ...ij', qu_scaled, ku)
-            sigmoid_term = sigmoid(lookahead_sim + lookahead_mask)
+            sigmoid_term = lookahead_sim.sigmoid().masked_fill(~causal_mask, 0.)
 
             Su = einsum('...ij, ...kj -> ...ik', term1, sigmoid_term)
 
-            Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc) + causal_mask
-            Sc = Sc.masked_fill(causal_mask, -torch.finfo(Sc.dtype).max)
+            Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
+            Sc = Sc.masked_fill(causal_mask, max_neg_value(Sc))
 
             scores = Sc - F.silu(Su)
 
             if return_next_cache:
                 # need to calculate U if returning next cache in parallel
-                weights = sigmoid(lookahead_sim).masked_fill(~causal_mask, 0.)
-                U = einsum('...ij, ...jd -> ...id', weights, vu)
+
+                U = einsum('...ij, ...jd -> ...id', sigmoid_term, vu)
 
                 next_cache = Cache(U, qu, kc, vc)
 
