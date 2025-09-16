@@ -90,10 +90,10 @@ class ParallelSlowCastle(Module):
             term1 = einsum('...id, ...jd -> ...ij', qc_scaled, vu)
             term1 = term1.masked_fill(causal_mask, 0.)
 
-            lookahead_sim = einsum('...id, ...jd -> ...ij', qu_scaled, ku)
-            sigmoid_term = lookahead_sim.sigmoid().masked_fill(~causal_mask, 0.)
+            lookahead_attn = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
+            lookahead_attn = lookahead_attn.masked_fill(~causal_mask, 0.)
 
-            Su = einsum('...ij, ...kj -> ...ik', term1, sigmoid_term)
+            Su = einsum('...ij, ...kj -> ...ik', term1, lookahead_attn)
 
             Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
             Sc = Sc.masked_fill(causal_mask, max_neg_value(Sc))
@@ -102,8 +102,7 @@ class ParallelSlowCastle(Module):
 
             if return_next_cache:
                 # need to calculate U if returning next cache in parallel
-
-                U = einsum('...ij, ...jd -> ...id', sigmoid_term, vu)
+                U = einsum('...ij, ...jd -> ...id', lookahead_attn, vu)
 
                 next_cache = Cache(U, qu, kc, vc)
 
@@ -117,8 +116,8 @@ class ParallelSlowCastle(Module):
 
             qu_cache_scaled = qu_cache * scale
 
-            update_weights = einsum('...id, ...jd -> ...ij', qu_cache_scaled, ku).sigmoid()
-            U_updated_prev = U_prev + (update_weights * vu)
+            lookahead_attn = einsum('...id, ...jd -> ...ij', qu_cache_scaled, ku).sigmoid()
+            U_updated_prev = U_prev + (lookahead_attn * vu)
 
             Ut = cat((U_updated_prev, torch.zeros_like(qu)), dim = -2)
 
