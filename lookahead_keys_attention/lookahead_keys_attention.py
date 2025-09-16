@@ -100,8 +100,8 @@ class ParallelSlowCastle(Module):
 
             if return_next_cache:
                 # need to calculate U if returning next cache in parallel
-
-                U = einsum('...ij, ...jd -> ...id', sigmoid(lookahead_sim).masked_fill(~causal_mask, 0.), vu)
+                weights = sigmoid(lookahead_sim).masked_fill(~causal_mask, 0.)
+                U = einsum('...ij, ...jd -> ...id', weights, vu)
 
                 next_cache = Cache(U, qu, kc, vc)
 
