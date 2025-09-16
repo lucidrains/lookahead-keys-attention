@@ -7,30 +7,37 @@ from lookahead_keys_attention.lookahead_keys_attention import (
 
 def test_naive_castle():
     batch_size = 2
-    seq_len = 8
+    seq_len = 16
     dim = 32
     dim_head = 16
     heads = 2
+    split = 8
 
     # define
 
     model = ParallelSlowCastle(dim=dim, dim_head=dim_head, heads=heads)
     model.eval()
 
-    # naive sequential
-
     input_sequence = torch.randn(batch_size, seq_len, dim)
 
-    cache = None
+    # initial parallel
+
+    with torch.no_grad():
+        parallel_part_output, cache = model.forward(input_sequence[:, :split, :], return_next_cache = True)
+
+    # naive sequential
+
     recurrent_outputs = []
     with torch.no_grad():
-        for t in range(seq_len):
+        for t in range(split, seq_len):
             x_t = input_sequence[:, t:t+1, :]
             
-            output_t, cache = model.forward(x_t, cache=cache)
+            output_t, cache = model.forward(x_t, cache = cache, return_next_cache = True)
             recurrent_outputs.append(output_t)
 
-    final_recurrent_output = torch.cat(recurrent_outputs, dim=1)
+    recurrent_outputs = torch.cat(recurrent_outputs, dim = 1)
+
+    final_recurrent_output = torch.cat((parallel_part_output, recurrent_outputs), dim = 1)
 
     # naive parallel
 

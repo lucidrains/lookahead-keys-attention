@@ -53,10 +53,13 @@ class ParallelSlowCastle(Module):
     def forward(
         self,
         x,
-        cache: Cache | None = None
+        cache: Cache | None = None,
+        return_next_cache = None
     ):
         batch_size, seq_len, scale, device = *x.shape[:2], self.scale, x.device
         is_inference = seq_len == 1
+
+        return_next_cache = default(return_next_cache, is_inference)
 
         # projection
 
@@ -75,6 +78,8 @@ class ParallelSlowCastle(Module):
         # handle single token vs multiple ones differently
 
         if not is_inference:
+            assert not exists(cache), 'parallel unable to handle prev cache for now'
+
             mask_shape = (seq_len, seq_len)
 
             causal_mask = torch.triu(torch.full(mask_shape, -inf, device = device), 1)
@@ -88,8 +93,15 @@ class ParallelSlowCastle(Module):
             Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc) + causal_mask
             
             scores = Sc - F.silu(Su)
- 
-            next_cache = None # todo - make sure this can be returned, need to compute U_updated_prev here
+
+            if return_next_cache:
+                # need to calculate U if returning next cache in parallel
+
+                weights = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
+                causal_mask = torch.triu(torch.ones(mask_shape, device = device, dtype = torch.bool), 1)
+                U = einsum('...ij, ...jd -> ...id', weights.masked_fill(~causal_mask, 0.), vu)
+
+                next_cache = Cache(U, qu, kc, vc)
 
         else:
 
@@ -109,8 +121,8 @@ class ParallelSlowCastle(Module):
             kc = cat((kc_cache, kc), dim = -2)
             vc = cat((vc_cache, vc), dim = -2)
 
-            Stc = einsum('...id, ...jd->...ij', qc_scaled, kc)
-            Stu = einsum('...id, ...jd->...ij', qc_scaled, Ut)
+            Stc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
+            Stu = einsum('...id, ...jd -> ...ij', qc_scaled, Ut)
 
             scores = Stc - F.silu(Stu)
 
@@ -131,7 +143,7 @@ class ParallelSlowCastle(Module):
 
         out = self.combine_heads(out)
 
-        if not is_inference:
+        if not return_next_cache:
             return out
 
         return out, next_cache
