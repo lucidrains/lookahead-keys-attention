@@ -87,7 +87,9 @@ class ParallelSlowCastle(Module):
             binary_causal_mask = torch.tril(torch.ones(mask_shape, device = device))
 
             term1 = einsum('...id, ...jd -> ...ij', qc_scaled, vu) * binary_causal_mask
-            sigmoid_term = sigmoid(einsum('...id, ...jd -> ...ij', qu_scaled, ku) + lookahead_mask)
+
+            lookahead_sim = einsum('...id, ...jd -> ...ij', qu_scaled, ku)
+            sigmoid_term = sigmoid(lookahead_sim + lookahead_mask)
 
             Su = einsum('...ij, ...kj -> ...ik', term1, sigmoid_term)
             Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc) + causal_mask
@@ -97,9 +99,8 @@ class ParallelSlowCastle(Module):
             if return_next_cache:
                 # need to calculate U if returning next cache in parallel
 
-                weights = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
                 causal_mask = torch.triu(torch.ones(mask_shape, device = device, dtype = torch.bool), 1)
-                U = einsum('...ij, ...jd -> ...id', weights.masked_fill(~causal_mask, 0.), vu)
+                U = einsum('...ij, ...jd -> ...id', sigmoid(lookahead_sim).masked_fill(~causal_mask, 0.), vu)
 
                 next_cache = Cache(U, qu, kc, vc)
 
