@@ -96,9 +96,9 @@ class ParallelSlowCastle(Module):
             Su = einsum('...ij, ...kj -> ...ik', term1, lookahead_attn)
 
             Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
-            Sc = Sc.masked_fill(causal_mask, max_neg_value(Sc))
 
             scores = Sc - F.silu(Su)
+            scores = scores.masked_fill(causal_mask, max_neg_value(scores))
 
             if return_next_cache:
                 # need to calculate U if returning next cache in parallel
