@@ -190,10 +190,11 @@ def _castle_attn_bwd_kernel(
         dsu_silu = -softmax_scale
         
         # Gradient through silu
-        dsu = dsu_silu * (1 + su * tl.sigmoid(su))
+        dsu = dsu_silu * (tl.sigmoid(su) * (1.0 + su * (1.0 - tl.sigmoid(su))))
         
         # Gradient through su = lookahead_attn @ vu
         dlookahead_attn = tl.dot(dsu, tl.trans(vu))
+        dvu = tl.dot(tl.trans(lookahead_attn), dsu)
         
         # Gradient through sigmoid
         dquku = dlookahead_attn * lookahead_attn * (1 - lookahead_attn)
@@ -201,6 +202,17 @@ def _castle_attn_bwd_kernel(
         # Accumulate gradients for Q and QU
         dq_acc += tl.dot(dqk, k)
         dqu_acc += tl.dot(dquku, ku)
+        
+        # Gradients for K, V, KU, VU
+        dk = tl.dot(tl.trans(dqk), q)
+        dku = tl.dot(tl.trans(dquku), qu)
+        dv = tl.dot(tl.trans(p), do)
+
+        # Store gradients for K, V, KU, VU
+        tl.atomic_add(dK + off_k, dk, mask=offs_n_curr[:, None] < N)
+        tl.atomic_add(dV + off_v, dv, mask=offs_n_curr[:, None] < N)
+        tl.atomic_add(dKU + off_k, dku, mask=offs_n_curr[:, None] < N)
+        tl.atomic_add(dVU + off_v, dvu, mask=offs_n_curr[:, None] < N)
         
         # Update pointers for next block
         off_k += BLOCK_N * stride_kn
