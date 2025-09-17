@@ -81,7 +81,7 @@ class ParallelSlowCastle(Module):
         # handle single token vs multiple ones differently
 
         if not is_inference:
-            assert not exists(cache), 'parallel unable to handle prev cache for now'
+            assert not exists(cache), 'must be inferencing single tokens if receiving cache'
 
             mask_shape = (seq_len, seq_len)
 
@@ -124,13 +124,15 @@ class ParallelSlowCastle(Module):
             kc = cat((kc_cache, kc), dim = -2)
             vc = cat((vc_cache, vc), dim = -2)
 
-            Stc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
-            Stu = einsum('...id, ...jd -> ...ij', qc_scaled, Ut)
+            Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
+            Su = einsum('...id, ...jd -> ...ij', qc_scaled, Ut)
 
-            scores = Stc - F.silu(Stu)
+            # combine causal scores with lookahead scores
 
-            next_qu = cat((qu_cache, qu), dim = -2)
-            next_cache = Cache(Ut, next_qu, kc, vc)
+            scores = Sc - F.silu(Su)
+
+            qu_next = cat((qu_cache, qu), dim = -2)
+            next_cache = Cache(Ut, qu_next, kc, vc)
 
         # attention
 

@@ -23,7 +23,7 @@ def test_naive_castle():
 
     # initial parallel
 
-    parallel_part_output, cache = model.forward(input_sequence[:, :split, :], return_next_cache = True)
+    parallel_part_output, cache = model(input_sequence[:, :split, :], return_next_cache = True)
 
     # naive sequential
 
@@ -32,7 +32,7 @@ def test_naive_castle():
     for t in range(split, seq_len):
         x_t = input_sequence[:, t:t+1, :]
         
-        output_t, cache = model.forward(x_t, cache = cache, return_next_cache = True)
+        output_t, cache = model(x_t, cache = cache, return_next_cache = True)
         recurrent_outputs.append(output_t)
 
     recurrent_outputs = torch.cat(recurrent_outputs, dim = 1)
@@ -41,8 +41,8 @@ def test_naive_castle():
 
     # naive parallel
 
-    with torch.no_grad():
-        output_parallel = model.forward(input_sequence)
+    output_parallel = model(input_sequence)
 
     assert final_recurrent_output.shape == output_parallel.shape
-    assert torch.allclose(final_recurrent_output, output_parallel, atol=1e-6)
+
+    assert torch.allclose(final_recurrent_output, output_parallel, atol = 1e-6)
