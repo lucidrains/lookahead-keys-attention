@@ -28,7 +28,6 @@ def _castle_attn_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
 ):
     """Castle attention forward kernel.
 
@@ -120,9 +119,8 @@ def _castle_attn_fwd_kernel(
         scores = qk - su_silu
 
         # causal mask for attention over k: keep k <= i, set future to -inf
-        if IS_CAUSAL:
-            causal_mask = offs_m[:, None] >= k_ids[None, :]
-            scores = tl.where(causal_mask, scores, -float("inf"))
+        causal_mask = offs_m[:, None] >= k_ids[None, :]
+        scores = tl.where(causal_mask, scores, -float("inf"))
 
         # online softmax update
         m_ij = tl.max(scores, axis=1)
@@ -156,7 +154,6 @@ def _castle_attn_bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
 ):
     """Castle attention backward kernel.
 
@@ -248,9 +245,8 @@ def _castle_attn_bwd_kernel(
         su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
 
-        if IS_CAUSAL:
-            causal_mask = offs_m[:, None] >= k_ids[None, :]
-            scores = tl.where(causal_mask, scores, -float("inf"))
+        causal_mask = offs_m[:, None] >= k_ids[None, :]
+        scores = tl.where(causal_mask, scores, -float("inf"))
 
         # online softmax update for this block
         m_ij = tl.max(scores, axis=1)
@@ -310,9 +306,8 @@ def _castle_attn_bwd_kernel(
         # compute scores and p using global m_i and l_i
         su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
-        if IS_CAUSAL:
-            causal_mask = offs_m[:, None] >= k_ids[None, :]
-            scores = tl.where(causal_mask, scores, -float("inf"))
+        causal_mask = offs_m[:, None] >= k_ids[None, :]
+        scores = tl.where(causal_mask, scores, -float("inf"))
 
         p = tl.exp(scores - m_i[:, None]) / l_i[:, None]
 
@@ -398,7 +393,7 @@ def _castle_attn_bwd_kernel(
 # Custom autograd function
 class CastleAttentionFunction(Function):
     @staticmethod
-    def forward(ctx, q, k, v, qu, ku, vu, scale, is_causal=True):
+    def forward(ctx, q, k, v, qu, ku, vu, scale):
         """
         Forward pass of Castle attention
         
@@ -406,7 +401,6 @@ class CastleAttentionFunction(Function):
             q, k, v: Standard attention tensors [batch, heads, seq_len, dim_head]
             qu, ku, vu: Lookahead attention tensors [batch, heads, seq_len, dim_head]
             scale: Scaling factor for queries
-            is_causal: Whether to apply causal masking
         """
         batch, heads, seq_len, dim_head = q.shape
         
@@ -432,13 +426,11 @@ class CastleAttentionFunction(Function):
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             batch, heads, seq_len, seq_len,
             BLOCK_M=64, BLOCK_N=64, BLOCK_DMODEL=dim_head,
-            IS_CAUSAL=is_causal,
         )
         
         # Save for backward
         ctx.save_for_backward(q, k, v, qu, ku, vu, o)
         ctx.scale = scale
-        ctx.is_causal = is_causal
         
         return o
     
@@ -446,7 +438,6 @@ class CastleAttentionFunction(Function):
     def backward(ctx, do):
         q, k, v, qu, ku, vu, o = ctx.saved_tensors
         scale = ctx.scale
-        is_causal = ctx.is_causal
 
         batch, heads, seq_len, dim_head = q.shape
 
@@ -473,14 +464,13 @@ class CastleAttentionFunction(Function):
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             batch, heads, seq_len, seq_len,
             BLOCK_M=64, BLOCK_N=64, BLOCK_DMODEL=dim_head,
-            IS_CAUSAL=is_causal,
         )
 
         # Chain rule for pre-scaled q and qu
         dq = dq * scale
         dqu = dqu * scale
 
-        return dq, dk, dv, dqu, dku, dvu, None, None
+        return dq, dk, dv, dqu, dku, dvu, None
 
 
 # Apply function
@@ -519,7 +509,6 @@ class TritonCastleAttention(nn.Module):
         
         Args:
             x: Input tensor [batch, seq_len, dim]
-            is_causal: Whether to apply causal masking
         
         Returns:
             Output tensor [batch, seq_len, dim]
@@ -534,7 +523,7 @@ class TritonCastleAttention(nn.Module):
         qu, ku, vu, qc, kc, vc = qkvs.unbind(0)
         
         # Apply Castle attention with Triton kernel
-        out = castle_attention(qc, kc, vc, qu, ku, vu, self.scale, True)
+        out = castle_attention(qc, kc, vc, qu, ku, vu, self.scale)
         
         # Merge heads
         out = out.transpose(1, 2).contiguous()  # [batch, seq_len, heads, dim_head]
