@@ -78,6 +78,7 @@ def _castle_attn_fwd_kernel(
         k = tl.load(k_ptrs, mask=k_ids[:, None] < N, other=0.0)
         v_k = tl.load(v_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
         qu_k = tl.load(qu_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
+        valid_k = k_ids < N
 
         # base qk scores for this k-block
         qk = tl.dot(q, tl.trans(k))  # [BM, BK]
@@ -94,12 +95,13 @@ def _castle_attn_fwd_kernel(
 
             v_j = tl.load(v_j_ptrs, mask=j_ids[:, None] < N, other=0.0)  # [BJ, D]
             ku_j = tl.load(ku_j_ptrs, mask=j_ids[:, None] < N, other=0.0)  # [BJ, D]
+            valid_j = j_ids < N
 
             # term1 = (qc_i · v_j) -> use q as qc (already scaled in host)
             t1 = tl.dot(q, tl.trans(v_j))  # [BM, BJ]
 
             # mask term1 so that positions with j > i are zeroed (keep j <= i)
-            mask_t1 = j_ids[None, :] <= offs_m[:, None]
+            mask_t1 = (j_ids[None, :] <= offs_m[:, None]) & valid_j[None, :]
             t1 = tl.where(mask_t1, t1, 0.0)
 
             # lookahead matrix = sigmoid(qu_k · ku_j)
@@ -107,7 +109,7 @@ def _castle_attn_fwd_kernel(
             la = tl.sigmoid(la)
 
             # mask lookahead so that only strictly upper (j > k) contributes
-            mask_la = j_ids[None, :] > k_ids[:, None]
+            mask_la = (j_ids[None, :] > k_ids[:, None]) & valid_j[None, :] & valid_k[:, None]
             la = tl.where(mask_la, la, 0.0)
 
             # accumulate su: t1 @ la^T over j dimension -> [BM, BK]
@@ -212,6 +214,7 @@ def _castle_attn_bwd_kernel(
         k = tl.load(k_ptrs, mask=k_ids[:, None] < N, other=0.0)
         v_k = tl.load(v_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
         qu_k = tl.load(qu_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
+        valid_k = k_ids < N
 
         # base qk scores
         qk = tl.dot(q, tl.trans(k))  # [BM, BK]
@@ -226,16 +229,17 @@ def _castle_attn_bwd_kernel(
 
             v_j = tl.load(v_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
             ku_j = tl.load(ku_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
+            valid_j = j_ids < N
 
             # t1(i,j) = q_i · vu_j (masked j <= i)
             t1 = tl.dot(q, tl.trans(v_j))  # [BM, BJ]
-            mask_t1 = j_ids[None, :] <= offs_m[:, None]
+            mask_t1 = (j_ids[None, :] <= offs_m[:, None]) & valid_j[None, :]
             t1 = tl.where(mask_t1, t1, 0.0)
 
             # la(k,j) = sigmoid(qu_k · ku_j) (masked j > k)
             la = tl.dot(qu_k, tl.trans(ku_j))  # [BK, BJ]
             la = tl.sigmoid(la)
-            mask_la = j_ids[None, :] > k_ids[:, None]
+            mask_la = (j_ids[None, :] > k_ids[:, None]) & valid_j[None, :] & valid_k[:, None]
             la = tl.where(mask_la, la, 0.0)
 
             # accumulate su over j: [BM,BK]
@@ -271,6 +275,7 @@ def _castle_attn_bwd_kernel(
         k = tl.load(k_ptrs, mask=k_ids[:, None] < N, other=0.0)
         v_k = tl.load(v_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
         qu_k = tl.load(qu_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
+        valid_k = k_ids < N
 
         # base qk scores
         qk = tl.dot(q, tl.trans(k))  # [BM, BK]
@@ -288,15 +293,16 @@ def _castle_attn_bwd_kernel(
 
             v_j = tl.load(v_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
             ku_j = tl.load(ku_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
+            valid_j = j_ids < N
 
             # t1 and masks
             t1 = tl.dot(q, tl.trans(v_j))  # [BM, BJ]
-            mask_t1 = j_ids[None, :] <= offs_m[:, None]
+            mask_t1 = (j_ids[None, :] <= offs_m[:, None]) & valid_j[None, :]
             t1 = tl.where(mask_t1, t1, 0.0)
 
             la = tl.dot(qu_k, tl.trans(ku_j))  # [BK, BJ]
             la = tl.sigmoid(la)
-            mask_la = j_ids[None, :] > k_ids[:, None]
+            mask_la = (j_ids[None, :] > k_ids[:, None]) & valid_j[None, :] & valid_k[:, None]
             la = tl.where(mask_la, la, 0.0)
 
             su_acc += tl.dot(t1, tl.trans(la))
@@ -337,15 +343,16 @@ def _castle_attn_bwd_kernel(
 
             v_j = tl.load(v_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
             ku_j = tl.load(ku_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
+            valid_j = j_ids < N
 
             # recompute t1 and la with masks
             t1 = tl.dot(q, tl.trans(v_j))  # [BM,BJ]
-            mask_t1 = j_ids[None, :] <= offs_m[:, None]
+            mask_t1 = (j_ids[None, :] <= offs_m[:, None]) & valid_j[None, :]
             t1 = tl.where(mask_t1, t1, 0.0)
 
             la = tl.dot(qu_k, tl.trans(ku_j))  # [BK,BJ]
             la = tl.sigmoid(la)
-            mask_la = j_ids[None, :] > k_ids[:, None]
+            mask_la = (j_ids[None, :] > k_ids[:, None]) & valid_j[None, :] & valid_k[:, None]
             la = tl.where(mask_la, la, 0.0)
 
             # dt1 = dSu @ la, mask to j<=i
