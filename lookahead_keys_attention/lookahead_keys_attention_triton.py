@@ -83,7 +83,7 @@ def _castle_attn_fwd_kernel(
         qk = tl.dot(q, tl.trans(k))  # [BM, BK]
 
         # accumulate Su over all j-blocks for this k-block
-        su_acc = tl.zeros_like(qk, dtype=tl.float32)  # [BM, BK]
+        su_acc = tl.zeros_like(qk)
 
         for start_j in range(0, N, BLOCK_N):
             j_ids = start_j + offs_n
@@ -114,7 +114,7 @@ def _castle_attn_fwd_kernel(
             su_acc += tl.dot(t1, tl.trans(la))
 
         # combine scores for this k-block
-        su_silu = tl.libdevice.silu(su_acc)
+        su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
 
         # causal mask for attention over k: keep k <= i, set future to -inf
@@ -217,7 +217,7 @@ def _castle_attn_bwd_kernel(
         qk = tl.dot(q, tl.trans(k))  # [BM, BK]
 
         # accumulate Su over all j-blocks
-        su_acc = tl.zeros_like(qk, dtype=tl.float32)
+        su_acc = tl.zeros_like(qk)
 
         for start_j in range(0, N, BLOCK_N):
             j_ids = start_j + offs_n
@@ -241,7 +241,7 @@ def _castle_attn_bwd_kernel(
             # accumulate su over j: [BM,BK]
             su_acc += tl.dot(t1, tl.trans(la))
 
-        su_silu = tl.libdevice.silu(su_acc)
+        su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
 
         if IS_CAUSAL:
@@ -276,7 +276,7 @@ def _castle_attn_bwd_kernel(
         qk = tl.dot(q, tl.trans(k))  # [BM, BK]
 
         # recompute su and also per-j contributions
-        su_acc = tl.zeros_like(qk, dtype=tl.float32)
+        su_acc = tl.zeros_like(qk)
 
         # We will accumulate dQU for this k-block across j_blocks
         dqu_blk = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
@@ -302,7 +302,7 @@ def _castle_attn_bwd_kernel(
             su_acc += tl.dot(t1, tl.trans(la))
 
         # compute scores and p using global m_i and l_i
-        su_silu = tl.libdevice.silu(su_acc)
+        su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= k_ids[None, :]
@@ -424,7 +424,7 @@ class CastleAttentionFunction(Function):
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             batch, heads, seq_len, seq_len,
-            BLOCK_M=128, BLOCK_N=128, BLOCK_DMODEL=dim_head,
+            BLOCK_M=64, BLOCK_N=64, BLOCK_DMODEL=dim_head,
             IS_CAUSAL=is_causal,
         )
         
@@ -465,7 +465,7 @@ class CastleAttentionFunction(Function):
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             batch, heads, seq_len, seq_len,
-            BLOCK_M=128, BLOCK_N=128, BLOCK_DMODEL=dim_head,
+            BLOCK_M=64, BLOCK_N=64, BLOCK_DMODEL=dim_head,
             IS_CAUSAL=is_causal,
         )
 
@@ -505,8 +505,7 @@ class TritonCastleAttention(nn.Module):
     
     def forward(
         self,
-        x: Tensor,
-        is_causal: bool = True
+        x: Tensor
     ) -> Tensor:
         """
         Forward pass
@@ -528,7 +527,7 @@ class TritonCastleAttention(nn.Module):
         qu, ku, vu, qc, kc, vc = qkvs.unbind(0)
         
         # Apply Castle attention with Triton kernel
-        out = castle_attention(qc, kc, vc, qu, ku, vu, self.scale, is_causal)
+        out = castle_attention(qc, kc, vc, qu, ku, vu, self.scale, True)
         
         # Merge heads
         out = out.transpose(1, 2).contiguous()  # [batch, seq_len, heads, dim_head]
