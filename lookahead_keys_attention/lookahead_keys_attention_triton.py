@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from functools import partial
+from einops.layers.torch import Rearrange
 
 # Constants
 LinearNoBias = partial(nn.Linear, bias=False)
@@ -498,6 +499,10 @@ class TritonCastleAttention(nn.Module):
         
         # Projections for all 6 components (qu, ku, vu, qc, kc, vc)
         self.to_all_qkv = LinearNoBias(dim, dim_inner * 6)
+        
+        self.split_heads = Rearrange('b n (qkv h d) -> qkv b h n d', qkv = 6, h = heads)
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+        
         self.combine_heads = LinearNoBias(dim_inner, dim)
     
     def forward(
@@ -517,17 +522,15 @@ class TritonCastleAttention(nn.Module):
         
         # Project to all qkv components
         qkvs = self.to_all_qkv(x)
-        qkvs = qkvs.view(batch, seq_len, 6, self.heads, self.dim_head)
-        qkvs = qkvs.permute(2, 0, 3, 1, 4)  # [6, batch, heads, seq_len, dim_head]
         
-        qu, ku, vu, qc, kc, vc = qkvs.unbind(0)
+        # Split heads using einops
+        qu, ku, vu, qc, kc, vc = self.split_heads(qkvs)
         
         # Apply Castle attention with Triton kernel
         out = castle_attention(qc, kc, vc, qu, ku, vu, self.scale)
         
-        # Merge heads
-        out = out.transpose(1, 2).contiguous()  # [batch, seq_len, heads, dim_head]
-        out = out.view(batch, seq_len, self.heads * self.dim_head)
+        # Merge heads using einops
+        out = self.merge_heads(out)
         
         # Final projection
         out = self.combine_heads(out)
