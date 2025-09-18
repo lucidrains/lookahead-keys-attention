@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, einsum
 from torch.autograd import Function
 import torch.nn.functional as F
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+    triton = None
+    tl = None
 
 from functools import partial
 from einops.layers.torch import Rearrange
@@ -17,20 +23,21 @@ LinearNoBias = partial(nn.Linear, bias=False)
 
 
 # Triton kernels for forward pass
-@triton.jit
-def _castle_attn_fwd_kernel(
-    Q, K, V, QU, KU, VU,
-    Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, M, N,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-):
-    """Castle attention forward kernel.
+if TRITON_AVAILABLE:
+    @triton.jit
+    def _castle_attn_fwd_kernel(
+        Q, K, V, QU, KU, VU,
+        Out,
+        stride_qz, stride_qh, stride_qm, stride_qk,
+        stride_kz, stride_kh, stride_kn, stride_kk,
+        stride_vz, stride_vh, stride_vn, stride_vk,
+        stride_oz, stride_oh, stride_om, stride_ok,
+        Z, H, M, N,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+    ):
+        """Castle attention forward kernel.
 
     Implements scores = (qc @ kc^T) - silu(Su), with
     Su(i,k) = sum_j (qc_i · v_j) * sigmoid(qu_k · ku_j) with appropriate
@@ -138,12 +145,12 @@ def _castle_attn_fwd_kernel(
 
     # store
     o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
-    tl.store(o_ptrs, out, mask=offs_m[:, None] < M)
+        tl.store(o_ptrs, out, mask=offs_m[:, None] < M)
 
 
-# Triton kernels for backward pass (two-phase recompute)
-@triton.jit
-def _castle_attn_bwd_kernel(
+    # Triton kernels for backward pass (two-phase recompute)
+    @triton.jit
+    def _castle_attn_bwd_kernel(
     Q, K, V, QU, KU, VU,
     dOut,
     dQ, dK, dV, dQU, dKU, dVU,
@@ -327,8 +334,9 @@ def _castle_attn_bwd_kernel(
         dv_blk = tl.dot(tl.trans(p), do)  # [BK,D]
 
         # dSu via s = qk - silu(Su)
+        # SiLU gradient: d/dx[x*sigmoid(x)] = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))
         sig_su = tl.sigmoid(su_acc)
-        dSu = -dS * (sig_su * (1.0 + su_acc * (1.0 - sig_su)))  # [BM,BK]
+        dSu = -dS * (sig_su + su_acc * sig_su * (1.0 - sig_su))  # [BM,BK]
 
         # Now accumulate lookahead path over j-blocks
         for start_j in range(0, N, BLOCK_N):
@@ -357,6 +365,8 @@ def _castle_attn_bwd_kernel(
 
             # dla = dSu^T @ t1
             dla = tl.dot(tl.trans(dSu), t1)  # [BK,BJ]
+            # Apply mask to dla (only where j > k)
+            dla = tl.where(mask_la, dla, 0.0)
 
             # dA = dla * la * (1 - la)
             dA = dla * la * (1.0 - la)  # [BK,BJ]
@@ -391,7 +401,153 @@ def _castle_attn_bwd_kernel(
     tl.store(dq_ptrs, dq_acc, mask=offs_m[:, None] < M)
 
 
-# Custom autograd function
+# PyTorch implementations for CPU/debugging
+class CastleAttentionPyTorchFunction(Function):
+    """Pure PyTorch implementation of Castle attention for CPU/debugging"""
+    
+    @staticmethod
+    def forward(ctx, q, k, v, qu, ku, vu, scale):
+        """
+        Forward pass of Castle attention in pure PyTorch
+        
+        Args:
+            q, k, v: Standard attention tensors [batch, heads, seq_len, dim_head]
+            qu, ku, vu: Lookahead attention tensors [batch, heads, seq_len, dim_head]
+            scale: Scaling factor for queries
+        """
+        batch, heads, seq_len, dim_head = q.shape
+        device = q.device
+        
+        # Apply scaling
+        q = q * scale
+        qu = qu * scale
+        
+        # Compute base QK scores
+        qk = einsum('bhid,bhjd->bhij', q, k)
+        
+        # Compute Su accumulation
+        su = torch.zeros_like(qk)
+        
+        # Term 1: (qc_i · vu_j) with causal mask (j <= i)
+        term1 = einsum('bhid,bhjd->bhij', q, vu)
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        term1.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        
+        # Lookahead matrix: sigmoid(qu_k · ku_j) with mask (j > k)
+        lookahead = torch.sigmoid(einsum('bhkd,bhjd->bhkj', qu, ku))
+        
+        # Create lookahead mask: only j > k contributes
+        for k_idx in range(seq_len):
+            for j_idx in range(seq_len):
+                if j_idx <= k_idx:
+                    lookahead[:, :, k_idx, j_idx] = 0.0
+        
+        # Accumulate Su = term1 @ lookahead^T
+        su = einsum('bhij,bhkj->bhik', term1, lookahead)
+        
+        # Combine scores
+        scores = qk - F.silu(su)
+        
+        # Apply causal mask to scores
+        scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        # Softmax
+        attn = F.softmax(scores, dim=-1)
+        
+        # Output
+        o = einsum('bhij,bhjd->bhid', attn, v)
+        
+        # Save for backward
+        ctx.save_for_backward(q, k, v, qu, ku, vu, su, attn, o)
+        ctx.scale = scale
+        
+        return o
+    
+    @staticmethod
+    def backward(ctx, do):
+        """Backward pass in pure PyTorch"""
+        q, k, v, qu, ku, vu, su, attn, o = ctx.saved_tensors
+        scale = ctx.scale
+        
+        batch, heads, seq_len, dim_head = q.shape
+        device = q.device
+        
+        # Gradient through softmax and attention
+        # dV = attn^T @ do
+        dv = einsum('bhij,bhid->bhjd', attn, do)
+        
+        # Gradient through softmax: dS = attn * (do @ v^T - (attn * (do @ v^T)).sum(dim=-1, keepdim=True))
+        scores_grad_interim = einsum('bhid,bhjd->bhij', do, v)
+        scores_grad = attn * (scores_grad_interim - (attn * scores_grad_interim).sum(dim=-1, keepdim=True))
+        
+        # Gradient through scores = qk - silu(su)
+        dqk = scores_grad
+        
+        # Gradient through SiLU: d/dx[silu(x)] = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))
+        sig_su = torch.sigmoid(su)
+        dsu = -scores_grad * (sig_su + su * sig_su * (1.0 - sig_su))
+        
+        # Gradient through qk = q @ k^T
+        dq_from_qk = einsum('bhij,bhjd->bhid', dqk, k)
+        dk = einsum('bhij,bhid->bhjd', dqk.transpose(-1, -2), q)
+        
+        # Now backward through Su computation
+        # Su = term1 @ lookahead^T where term1 = q @ vu^T (masked) and lookahead = sigmoid(qu @ ku^T) (masked)
+        
+        # Gradient w.r.t term1 and lookahead
+        term1 = einsum('bhid,bhjd->bhij', q, vu)
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        term1.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        
+        lookahead_raw = einsum('bhkd,bhjd->bhkj', qu, ku)
+        lookahead = torch.sigmoid(lookahead_raw)
+        
+        # Apply lookahead mask
+        for k_idx in range(seq_len):
+            for j_idx in range(seq_len):
+                if j_idx <= k_idx:
+                    lookahead[:, :, k_idx, j_idx] = 0.0
+        
+        # dterm1 = dsu @ lookahead
+        dterm1 = einsum('bhik,bhkj->bhij', dsu, lookahead)
+        dterm1.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        
+        # dlookahead = dsu^T @ term1
+        dlookahead = einsum('bhik,bhij->bhkj', dsu.transpose(-1, -2), term1)
+        
+        # Apply lookahead mask to gradient
+        for k_idx in range(seq_len):
+            for j_idx in range(seq_len):
+                if j_idx <= k_idx:
+                    dlookahead[:, :, k_idx, j_idx] = 0.0
+        
+        # Gradient through sigmoid
+        dlookahead_raw = dlookahead * lookahead * (1.0 - lookahead)
+        
+        # Accumulate gradients
+        # dq from term1 = q @ vu^T
+        dq_from_term1 = einsum('bhij,bhjd->bhid', dterm1, vu)
+        
+        # dvu from term1
+        dvu = einsum('bhij,bhid->bhjd', dterm1.transpose(-1, -2), q)
+        
+        # dqu from lookahead = qu @ ku^T
+        dqu = einsum('bhkj,bhjd->bhkd', dlookahead_raw, ku)
+        
+        # dku from lookahead
+        dku = einsum('bhkj,bhkd->bhjd', dlookahead_raw.transpose(-1, -2), qu)
+        
+        # Combine dq gradients
+        dq = dq_from_qk + dq_from_term1
+        
+        # Apply chain rule for pre-scaled q and qu
+        dq = dq * scale
+        dqu = dqu * scale
+        
+        return dq, dk, dv, dqu, dku, dvu, None
+
+
+# Custom autograd function with Triton
 class CastleAttentionFunction(Function):
     @staticmethod
     def forward(ctx, q, k, v, qu, ku, vu, scale):
@@ -474,20 +630,22 @@ class CastleAttentionFunction(Function):
         return dq, dk, dv, dqu, dku, dvu, None
 
 
-# Apply function
-castle_attention = CastleAttentionFunction.apply
+# Apply functions
+castle_attention_triton = CastleAttentionFunction.apply
+castle_attention_pytorch = CastleAttentionPyTorchFunction.apply
 
 
 # Module wrapper
 class TritonCastleAttention(nn.Module):
     """
-    Triton-based Castle attention module with flash attention optimization
+    Castle attention module with both Triton and PyTorch implementations
     """
     def __init__(
         self,
         dim,
         heads=8,
         dim_head=64,
+        use_triton=None,  # None = auto, True = force triton, False = force pytorch
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -496,6 +654,12 @@ class TritonCastleAttention(nn.Module):
         self.dim_head = dim_head
         self.heads = heads
         self.scale = dim_head ** -0.5
+        
+        # Auto-detect whether to use Triton
+        if use_triton is None:
+            self.use_triton = TRITON_AVAILABLE and torch.cuda.is_available()
+        else:
+            self.use_triton = use_triton and TRITON_AVAILABLE
         
         # Projections for all 6 components (qu, ku, vu, qc, kc, vc)
         self.to_all_qkv = LinearNoBias(dim, dim_inner * 6)
@@ -507,13 +671,15 @@ class TritonCastleAttention(nn.Module):
     
     def forward(
         self,
-        x: Tensor
+        x: Tensor,
+        use_triton: bool = None
     ) -> Tensor:
         """
         Forward pass
         
         Args:
             x: Input tensor [batch, seq_len, dim]
+            use_triton: Override the default implementation choice for this forward pass
         
         Returns:
             Output tensor [batch, seq_len, dim]
@@ -526,8 +692,14 @@ class TritonCastleAttention(nn.Module):
         # Split heads using einops
         qu, ku, vu, qc, kc, vc = self.split_heads(qkvs)
         
-        # Apply Castle attention with Triton kernel
-        out = castle_attention(qc, kc, vc, qu, ku, vu, self.scale)
+        # Choose implementation
+        use_triton_now = self.use_triton if use_triton is None else use_triton
+        
+        # Apply Castle attention with chosen implementation
+        if use_triton_now and TRITON_AVAILABLE:
+            out = castle_attention_triton(qc, kc, vc, qu, ku, vu, self.scale)
+        else:
+            out = castle_attention_pytorch(qc, kc, vc, qu, ku, vu, self.scale)
         
         # Merge heads using einops
         out = self.merge_heads(out)
