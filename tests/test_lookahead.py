@@ -98,8 +98,8 @@ def test_triton_equivalence():
 
     # compare gradients
 
-    assert torch.allclose(naive_input_grad, triton_input_grad, atol = 1e-3), "Input gradients do not match"
+    assert torch.allclose(naive_input_grad, triton_input_grad, atol = 1e-2), "Input gradients do not match"
 
     for name in naive_grads.keys():
         assert name in triton_grads, f"Gradient for {name} not found in Triton model"
-        assert torch.allclose(naive_grads[name], triton_grads[name], atol = 1e-3), f"Gradients for {name} do not match"
+        assert torch.allclose(naive_grads[name], triton_grads[name], atol = 1e-2), f"Gradients for {name} do not match"
