@@ -6,8 +6,11 @@ from torch import Tensor, einsum
 from torch.autograd import Function
 import torch.nn.functional as F
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    raise ImportError("Triton is not installed. Please install triton to use the Triton implementation.")
 
 from functools import partial
 from einops.layers.torch import Rearrange

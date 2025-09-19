@@ -10,9 +10,15 @@ from torch.autograd import Function
 import torch.nn.functional as F
 
 from einops.layers.torch import Rearrange
+from rotary_embedding_torch import RotaryEmbedding
 
-# Import Triton implementation
-from .lookahead_keys_attention_triton import castle_attention_triton
+# Try to import Triton implementation
+try:
+    from .lookahead_keys_attention_triton import castle_attention_triton
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+    castle_attention_triton = None
 
 # constants
 
@@ -39,7 +45,8 @@ class Castle(Module):
         dim,
         heads = 8,
         dim_head = 64,
-        use_triton = None
+        use_triton = None,
+        rotary_emb = False
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -50,11 +57,18 @@ class Castle(Module):
 
         # Auto-detect whether to use Triton
         if use_triton is None:
-            self.use_triton = torch.cuda.is_available()
+            self.use_triton = torch.cuda.is_available() and TRITON_AVAILABLE
         else:
+            if use_triton and not TRITON_AVAILABLE:
+                raise AssertionError("use_triton=True but Triton is not available. Please install triton or set use_triton=False")
             self.use_triton = use_triton
 
         self.scale = dim_head ** -0.5
+
+        # Rotary embeddings
+        self.rotary_emb = None
+        if rotary_emb:
+            self.rotary_emb = RotaryEmbedding(dim = dim_head)
 
         self.to_all_qkv = LinearNoBias(dim, dim_inner * 6)
 
@@ -82,6 +96,18 @@ class Castle(Module):
         # u - lookup keys related
 
         qu, ku, vu, qc, kc, vc = self.split_heads(qkvs)
+
+        # Apply rotary embeddings if enabled
+        if exists(self.rotary_emb):
+            # Calculate position offset for sequential processing
+            offset = cache.kc_cache.shape[-2] if exists(cache) else 0
+            
+            # Apply to causal query/key and lookahead query/key/value with offset
+            qc = self.rotary_emb.rotate_queries_or_keys(qc, offset=offset)
+            kc = self.rotary_emb.rotate_queries_or_keys(kc, offset=offset)
+            qu = self.rotary_emb.rotate_queries_or_keys(qu, offset=offset)
+            ku = self.rotary_emb.rotate_queries_or_keys(ku, offset=offset)
+            vu = self.rotary_emb.rotate_queries_or_keys(vu, offset=offset)
 
         # scaled queries
 

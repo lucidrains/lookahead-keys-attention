@@ -5,6 +5,15 @@ from lookahead_keys_attention.lookahead_keys_attention import (
     Castle
 )
 
+try:
+    from lookahead_keys_attention.lookahead_keys_attention_triton import (
+        TritonCastleAttention
+    )
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+    TritonCastleAttention = None
+
 @torch.no_grad()
 def test_castle_reference_implementation():
     """Test Castle with reference PyTorch implementation (use_triton=False)"""
@@ -47,9 +56,13 @@ def test_castle_reference_implementation():
 
     assert torch.allclose(final_recurrent_output, output_parallel, atol = 1e-6)
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_castle_triton_vs_reference():
     """Test Castle with Triton implementation vs reference implementation"""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if not TRITON_AVAILABLE:
+        pytest.skip("Triton not available")
+    
     batch_size = 2
     seq_len = 128
     dim = 32
@@ -102,3 +115,122 @@ def test_castle_triton_vs_reference():
         assert torch.allclose(reference_grads[name], triton_grads[name], atol = 1e-2), f"Gradients for {name} do not match"
 
 
+def test_castle_triton_vs_old_triton():
+    """Test Castle with Triton vs the old separate TritonCastleAttention class"""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if not TRITON_AVAILABLE:
+        pytest.skip("Triton not available")
+    
+    batch_size = 2
+    seq_len = 64
+    dim = 32
+    dim_head = 16
+    heads = 2
+
+    # define models
+    castle_triton = Castle(dim=dim, dim_head=dim_head, heads=heads, use_triton=True).cuda()
+    old_triton = TritonCastleAttention(dim=dim, dim_head=dim_head, heads=heads).cuda()
+
+    # copy weights
+    old_triton.to_all_qkv.weight.data.copy_(castle_triton.to_all_qkv.weight.data)
+    old_triton.combine_heads.weight.data.copy_(castle_triton.combine_heads.weight.data)
+
+    # inputs
+    inp = torch.randn(batch_size, seq_len, dim).cuda()
+
+    # forward pass
+    castle_output = castle_triton(inp)
+    old_output = old_triton(inp)
+
+    assert torch.allclose(castle_output, old_output, atol = 1e-5), "Castle Triton vs Old Triton outputs do not match"
+
+@torch.no_grad()
+def test_castle_with_rotary_embeddings():
+    """Test Castle with rotary embeddings enabled"""
+    batch_size = 2
+    seq_len = 16
+    dim = 256
+    dim_head = 32
+    heads = 8
+    split = 8
+
+    # Create models with and without rotary embeddings
+    model_no_rotary = Castle(dim=dim, dim_head=dim_head, heads=heads, rotary_emb=False, use_triton=False)
+    model_with_rotary = Castle(dim=dim, dim_head=dim_head, heads=heads, rotary_emb=True, use_triton=False)
+    
+    # Copy weights to ensure only rotary embeddings cause differences
+    model_with_rotary.to_all_qkv.weight.data.copy_(model_no_rotary.to_all_qkv.weight.data)
+    model_with_rotary.combine_heads.weight.data.copy_(model_no_rotary.combine_heads.weight.data)
+    
+    model_no_rotary.eval()
+    model_with_rotary.eval()
+
+    input_sequence = torch.randn(batch_size, seq_len, dim)
+
+    # Test parallel execution
+    output_no_rotary = model_no_rotary(input_sequence)
+    output_with_rotary = model_with_rotary(input_sequence)
+    
+    # Outputs should have same shape
+    assert output_no_rotary.shape == output_with_rotary.shape == (batch_size, seq_len, dim)
+    
+    # Outputs should be different due to rotary embeddings
+    assert not torch.allclose(output_no_rotary, output_with_rotary, atol=1e-6), \
+        "Outputs should differ when rotary embeddings are applied"
+
+    # Test sequential execution with rotary embeddings
+    parallel_part_output, cache = model_with_rotary(
+        input_sequence[:, :split, :], 
+        return_next_cache=True
+    )
+    
+    recurrent_outputs = []
+    for t in range(split, seq_len):
+        x_t = input_sequence[:, t:t+1, :]
+        output_t, cache = model_with_rotary(x_t, cache=cache, return_next_cache=True)
+        recurrent_outputs.append(output_t)
+    
+    recurrent_outputs = torch.cat(recurrent_outputs, dim=1)
+    final_recurrent_output = torch.cat((parallel_part_output, recurrent_outputs), dim=1)
+    
+    # Sequential and parallel should match for model with rotary (with slightly higher tolerance due to rotary)
+    assert torch.allclose(final_recurrent_output, output_with_rotary, atol=1e-3), \
+        "Sequential and parallel outputs should match with rotary embeddings"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_castle_rotary_with_triton():
+    """Test Castle with both rotary embeddings and Triton"""
+    if not TRITON_AVAILABLE:
+        pytest.skip("Triton not available")
+    
+    batch_size = 2
+    seq_len = 64
+    dim = 256
+    dim_head = 32
+    heads = 8
+
+    # Create models
+    model_reference = Castle(
+        dim=dim, dim_head=dim_head, heads=heads, 
+        rotary_emb=True, use_triton=False
+    ).cuda()
+    
+    model_triton = Castle(
+        dim=dim, dim_head=dim_head, heads=heads,
+        rotary_emb=True, use_triton=True
+    ).cuda()
+    
+    # Copy weights
+    model_triton.to_all_qkv.weight.data.copy_(model_reference.to_all_qkv.weight.data)
+    model_triton.combine_heads.weight.data.copy_(model_reference.combine_heads.weight.data)
+    
+    # Test forward pass
+    inp = torch.randn(batch_size, seq_len, dim).cuda()
+    
+    output_reference = model_reference(inp)
+    output_triton = model_triton(inp)
+    
+    # Outputs should match between reference and triton with rotary
+    assert torch.allclose(output_reference, output_triton, atol=1e-3), \
+        "Reference and Triton outputs should match with rotary embeddings"
