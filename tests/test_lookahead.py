@@ -4,9 +4,6 @@ import pytest
 from lookahead_keys_attention.lookahead_keys_attention import (
     Castle
 )
-from lookahead_keys_attention.lookahead_keys_attention_triton import (
-    TritonCastleAttention
-)
 
 @torch.no_grad()
 def test_castle_reference_implementation():
@@ -105,28 +102,3 @@ def test_castle_triton_vs_reference():
         assert torch.allclose(reference_grads[name], triton_grads[name], atol = 1e-2), f"Gradients for {name} do not match"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_castle_triton_vs_old_triton():
-    """Test Castle with Triton vs the old separate TritonCastleAttention class"""
-    batch_size = 2
-    seq_len = 64
-    dim = 32
-    dim_head = 16
-    heads = 2
-
-    # define models
-    castle_triton = Castle(dim=dim, dim_head=dim_head, heads=heads, use_triton=True).cuda()
-    old_triton = TritonCastleAttention(dim=dim, dim_head=dim_head, heads=heads).cuda()
-
-    # copy weights
-    old_triton.to_all_qkv.weight.data.copy_(castle_triton.to_all_qkv.weight.data)
-    old_triton.combine_heads.weight.data.copy_(castle_triton.combine_heads.weight.data)
-
-    # inputs
-    inp = torch.randn(batch_size, seq_len, dim).cuda()
-
-    # forward pass
-    castle_output = castle_triton(inp)
-    old_output = old_triton(inp)
-
-    assert torch.allclose(castle_output, old_output, atol = 1e-5), "Castle Triton vs Old Triton outputs do not match"
