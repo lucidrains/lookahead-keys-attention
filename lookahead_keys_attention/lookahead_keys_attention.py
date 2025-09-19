@@ -103,11 +103,10 @@ class Castle(Module):
             offset = cache.kc_cache.shape[-2] if exists(cache) else 0
             
             # Apply to causal query/key and lookahead query/key/value with offset
-            qc = self.rotary_emb.rotate_queries_or_keys(qc, offset=offset)
-            kc = self.rotary_emb.rotate_queries_or_keys(kc, offset=offset)
-            qu = self.rotary_emb.rotate_queries_or_keys(qu, offset=offset)
-            ku = self.rotary_emb.rotate_queries_or_keys(ku, offset=offset)
-            vu = self.rotary_emb.rotate_queries_or_keys(vu, offset=offset)
+            qc, kc, qu, ku, vu = map(
+                lambda t: self.rotary_emb.rotate_queries_or_keys(t, offset=offset),
+                (qc, kc, qu, ku, vu)
+            )
 
         # scaled queries
 
