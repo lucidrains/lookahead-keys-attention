@@ -11,6 +11,9 @@ import torch.nn.functional as F
 
 from einops.layers.torch import Rearrange
 
+# Import Triton implementation
+from .lookahead_keys_attention_triton import castle_attention_triton
+
 # constants
 
 LinearNoBias = partial(nn.Linear, bias=False)
@@ -28,14 +31,15 @@ def default(val, d):
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
-# naive castle implementation
+# castle implementation
 
-class ParallelSlowCastle(Module):
+class Castle(Module):
     def __init__(
         self,
         dim,
         heads = 8,
-        dim_head = 64
+        dim_head = 64,
+        use_triton = None
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -43,6 +47,12 @@ class ParallelSlowCastle(Module):
         self.dim = dim
         self.dim_head = dim_head
         self.heads = heads
+
+        # Auto-detect whether to use Triton
+        if use_triton is None:
+            self.use_triton = torch.cuda.is_available()
+        else:
+            self.use_triton = use_triton
 
         self.scale = dim_head ** -0.5
 
@@ -83,31 +93,51 @@ class ParallelSlowCastle(Module):
         if not is_inference:
             assert not exists(cache), 'must be inferencing single tokens if receiving cache'
 
-            mask_shape = (seq_len, seq_len)
+            # Use Triton implementation if enabled and tensors are on CUDA
+            if self.use_triton and qc.is_cuda:
+                # Use Triton path - much more efficient for parallel training
+                out = castle_attention_triton(qc_scaled, kc, vc, qu_scaled, ku, vu, 1.0)
 
-            causal_mask = torch.ones(mask_shape, device = device, dtype = torch.bool).triu(1)
+                if return_next_cache:
+                    # Calculate lookahead keys for cache
+                    mask_shape = (seq_len, seq_len)
+                    causal_mask = torch.ones(mask_shape, device = device, dtype = torch.bool).triu(1)
+                    lookahead_attn = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
+                    lookahead_attn = lookahead_attn.masked_fill(~causal_mask, 0.)
+                    U = einsum('...ij, ...jd -> ...id', lookahead_attn, vu)
+                    next_cache = Cache(U, qu, kc, vc)
+            else:
+                # Use reference PyTorch implementation
+                mask_shape = (seq_len, seq_len)
 
-            term1 = einsum('...id, ...jd -> ...ij', qc_scaled, vu)
-            term1 = term1.masked_fill(causal_mask, 0.)
+                causal_mask = torch.ones(mask_shape, device = device, dtype = torch.bool).triu(1)
 
-            lookahead_attn = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
-            lookahead_attn = lookahead_attn.masked_fill(~causal_mask, 0.)
+                term1 = einsum('...id, ...jd -> ...ij', qc_scaled, vu)
+                term1 = term1.masked_fill(causal_mask, 0.)
 
-            Su = einsum('...ij, ...kj -> ...ik', term1, lookahead_attn)
+                lookahead_attn = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
+                lookahead_attn = lookahead_attn.masked_fill(~causal_mask, 0.)
 
-            Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
+                Su = einsum('...ij, ...kj -> ...ik', term1, lookahead_attn)
 
-            scores = Sc - F.silu(Su)
-            scores = scores.masked_fill(causal_mask, max_neg_value(scores))
+                Sc = einsum('...id, ...jd -> ...ij', qc_scaled, kc)
 
-            if return_next_cache:
-                # need to calculate U if returning next cache in parallel
-                U = einsum('...ij, ...jd -> ...id', lookahead_attn, vu)
+                scores = Sc - F.silu(Su)
+                scores = scores.masked_fill(causal_mask, max_neg_value(scores))
 
-                next_cache = Cache(U, qu, kc, vc)
+                # attention
+                attn = scores.softmax(dim = -1)
+
+                # aggregate
+                out = einsum('...ij, ...jd -> ...id', attn, vc)
+
+                if return_next_cache:
+                    # need to calculate U if returning next cache in parallel
+                    U = einsum('...ij, ...jd -> ...id', lookahead_attn, vu)
+                    next_cache = Cache(U, qu, kc, vc)
 
         else:
-
+            # Inference mode (single token) - always use reference implementation
             if not exists(cache):
                 empty_tensor = qu[..., 0:0, :] # (batch, heads, 0, dim_head)
                 cache = (empty_tensor,) * 4
@@ -128,19 +158,16 @@ class ParallelSlowCastle(Module):
             Su = einsum('...id, ...jd -> ...ij', qc_scaled, Ut)
 
             # combine causal scores with lookahead scores
-
             scores = Sc - F.silu(Su)
+
+            # attention
+            attn = scores.softmax(dim = -1)
+
+            # aggregate
+            out = einsum('...ij, ...jd -> ...id', attn, vc)
 
             qu_next = cat((qu_cache, qu), dim = -2)
             next_cache = Cache(Ut, qu_next, kc, vc)
-
-        # attention
-
-        attn = scores.softmax(dim = -1)
-
-        # aggregate
-
-        out = einsum('...ij, ...jd -> ...id', attn, vc)
 
         # merge and combine heads
 

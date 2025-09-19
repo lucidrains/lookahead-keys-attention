@@ -2,14 +2,15 @@ import torch
 import pytest
 
 from lookahead_keys_attention.lookahead_keys_attention import (
-    ParallelSlowCastle
+    Castle
 )
 from lookahead_keys_attention.lookahead_keys_attention_triton import (
     TritonCastleAttention
 )
 
 @torch.no_grad()
-def test_naive_castle():
+def test_castle_reference_implementation():
+    """Test Castle with reference PyTorch implementation (use_triton=False)"""
     batch_size = 2
     seq_len = 16
     dim = 32
@@ -17,9 +18,8 @@ def test_naive_castle():
     heads = 2
     split = 8
 
-    # define
-
-    model = ParallelSlowCastle(dim=dim, dim_head=dim_head, heads=heads)
+    # define - explicitly use reference implementation
+    model = Castle(dim=dim, dim_head=dim_head, heads=heads, use_triton=False)
     model.eval()
 
     input_sequence = torch.randn(batch_size, seq_len, dim)
@@ -51,7 +51,8 @@ def test_naive_castle():
     assert torch.allclose(final_recurrent_output, output_parallel, atol = 1e-6)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_triton_equivalence():
+def test_castle_triton_vs_reference():
+    """Test Castle with Triton implementation vs reference implementation"""
     batch_size = 2
     seq_len = 128
     dim = 32
@@ -59,13 +60,12 @@ def test_triton_equivalence():
     heads = 2
 
     # define models
-    
-    naive_model = ParallelSlowCastle(dim=dim, dim_head=dim_head, heads=heads).cuda()
-    triton_model = TritonCastleAttention(dim=dim, dim_head=dim_head, heads=heads).cuda()
+    reference_model = Castle(dim=dim, dim_head=dim_head, heads=heads, use_triton=False).cuda()
+    triton_model = Castle(dim=dim, dim_head=dim_head, heads=heads, use_triton=True).cuda()
 
-    # copy weights from naive to triton model
-    triton_model.to_all_qkv.weight.data.copy_(naive_model.to_all_qkv.weight.data)
-    triton_model.combine_heads.weight.data.copy_(naive_model.combine_heads.weight.data)
+    # copy weights from reference to triton model
+    triton_model.to_all_qkv.weight.data.copy_(reference_model.to_all_qkv.weight.data)
+    triton_model.combine_heads.weight.data.copy_(reference_model.combine_heads.weight.data)
 
     # inputs
     
@@ -73,19 +73,19 @@ def test_triton_equivalence():
     inp.requires_grad_()
 
     # forward pass
-    
-    naive_output = naive_model(inp)
+
+    reference_output = reference_model(inp)
     triton_output = triton_model(inp)
 
-    assert torch.allclose(naive_output, triton_output, atol = 1e-3), "Forward outputs do not match"
+    assert torch.allclose(reference_output, triton_output, atol = 1e-3), "Forward outputs do not match"
 
     # backward pass
-    
-    grad_output = torch.randn_like(naive_output)
-    
-    naive_output.backward(grad_output, retain_graph=True)
-    naive_grads = {name: p.grad.clone() for name, p in naive_model.named_parameters() if p.grad is not None}
-    naive_input_grad = inp.grad.clone()
+
+    grad_output = torch.randn_like(reference_output)
+
+    reference_output.backward(grad_output, retain_graph=True)
+    reference_grads = {name: p.grad.clone() for name, p in reference_model.named_parameters() if p.grad is not None}
+    reference_input_grad = inp.grad.clone()
 
     inp.grad.zero_()
     for p in triton_model.parameters():
@@ -98,8 +98,35 @@ def test_triton_equivalence():
 
     # compare gradients
 
-    assert torch.allclose(naive_input_grad, triton_input_grad, atol = 1e-2), "Input gradients do not match"
+    assert torch.allclose(reference_input_grad, triton_input_grad, atol = 1e-2), "Input gradients do not match"
 
-    for name in naive_grads.keys():
+    for name in reference_grads.keys():
         assert name in triton_grads, f"Gradient for {name} not found in Triton model"
-        assert torch.allclose(naive_grads[name], triton_grads[name], atol = 1e-2), f"Gradients for {name} do not match"
+        assert torch.allclose(reference_grads[name], triton_grads[name], atol = 1e-2), f"Gradients for {name} do not match"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_castle_triton_vs_old_triton():
+    """Test Castle with Triton vs the old separate TritonCastleAttention class"""
+    batch_size = 2
+    seq_len = 64
+    dim = 32
+    dim_head = 16
+    heads = 2
+
+    # define models
+    castle_triton = Castle(dim=dim, dim_head=dim_head, heads=heads, use_triton=True).cuda()
+    old_triton = TritonCastleAttention(dim=dim, dim_head=dim_head, heads=heads).cuda()
+
+    # copy weights
+    old_triton.to_all_qkv.weight.data.copy_(castle_triton.to_all_qkv.weight.data)
+    old_triton.combine_heads.weight.data.copy_(castle_triton.combine_heads.weight.data)
+
+    # inputs
+    inp = torch.randn(batch_size, seq_len, dim).cuda()
+
+    # forward pass
+    castle_output = castle_triton(inp)
+    old_output = old_triton(inp)
+
+    assert torch.allclose(castle_output, old_output, atol = 1e-5), "Castle Triton vs Old Triton outputs do not match"
