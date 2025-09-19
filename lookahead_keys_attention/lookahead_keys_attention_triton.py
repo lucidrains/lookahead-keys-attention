@@ -555,10 +555,10 @@ class CastleAttentionFunction(Function):
         )
 
         # Allocate gradients in half precision
-        dq = torch.zeros_like(q)
+        dq = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
-        dqu = torch.zeros_like(qu)
+        dqu = torch.zeros_like(qu, dtype=torch.float32)
         dku = torch.zeros_like(ku)
         dvu = torch.zeros_like(vu)
 
