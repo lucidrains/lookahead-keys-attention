@@ -15,10 +15,6 @@ except ImportError:
 from functools import partial
 from einops.layers.torch import Rearrange
 
-# Constants
-LinearNoBias = partial(nn.Linear, bias=False)
-
-
 # Triton kernels for forward pass
 @triton.jit
 def _castle_attn_fwd_kernel(
@@ -561,8 +557,5 @@ class CastleAttentionFunction(Function):
 
         return dq, dk, dv, dqu, dku, dvu, None
 
-
 # Apply function
 castle_attention_triton = CastleAttentionFunction.apply
-
-
