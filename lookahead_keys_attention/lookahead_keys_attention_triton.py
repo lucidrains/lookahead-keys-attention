@@ -23,12 +23,12 @@ LinearNoBias = partial(nn.Linear, bias=False)
 @triton.jit
 def _castle_attn_fwd_kernel(
     Q, K, V, QU, KU, VU,
-    Out,
+    Out, Lse,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, M, N,
+    Z, H, M, N, seqlen_q_rounded,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -139,6 +139,11 @@ def _castle_attn_fwd_kernel(
     # finalize
     out = acc / l_i[:, None]
 
+    # compute and store LSE (log-sum-exp)
+    lse_i = m_i + tl.log(l_i)
+    lse_ptrs = Lse + pid_hz * seqlen_q_rounded + offs_m
+    tl.store(lse_ptrs, lse_i, mask=offs_m < M)
+
     # store
     o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(o_ptrs, out, mask=offs_m[:, None] < M)
@@ -187,27 +192,27 @@ def _castle_attn_bwd_preprocess_do_o_dot(
     tl.store(delta_ptrs, delta, mask=offs_m < M)
 
 
-# Triton kernels for backward pass (two-phase recompute)
+# Triton kernels for backward pass (using stored LSE)
 @triton.jit
 def _castle_attn_bwd_kernel(
     Q, K, V, QU, KU, VU,
-    dOut, Delta,
+    dOut, Delta, Lse,
     dQ, dK, dV, dQU, dKU, dVU,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, M, N,
+    Z, H, M, N, seqlen_q_rounded,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
 ):
     """Castle attention backward kernel.
 
-    Recomputes scores and softmax normalization in two passes over key blocks:
-    - Pass 1: online softmax to derive row-wise max m_i and denom l_i.
-    - Pass 2: compute probabilities p, then accumulate gradients for
-      Q,K,V (causal) and QU,KU,VU (lookahead) via chain rule.
+    Uses stored LSE from forward pass to compute gradients efficiently.
+    Only requires a single pass over key blocks, computing probabilities p
+    directly from stored LSE, then accumulating gradients for
+    Q,K,V (causal) and QU,KU,VU (lookahead) via chain rule.
     """
     pid_m = tl.program_id(0)
     pid_hz = tl.program_id(1)
@@ -247,68 +252,11 @@ def _castle_attn_bwd_kernel(
     delta_ptrs = Delta + pid_hz * M + offs_m
     delta = tl.load(delta_ptrs, mask=offs_m < M, other=0.0)
 
-    # Pass 1: compute m_i and l_i via online softmax over all key blocks
-    m_i = tl.full([BLOCK_M], value=-float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # load precomputed LSE values from forward pass
+    lse_ptrs = Lse + pid_hz * seqlen_q_rounded + offs_m
+    lse_i = tl.load(lse_ptrs, mask=offs_m < M, other=0.0)
 
-    for start_k in range(0, N, BLOCK_N):
-        k_ids = start_k + offs_n
-
-        # load k, v, qu for current k-block
-        k_ptrs = k_base + k_ids[:, None] * stride_kn + offs_d[None, :] * stride_kk
-        v_k_ptrs = v_base + k_ids[:, None] * stride_vn + offs_d[None, :] * stride_vk
-        qu_k_ptrs = qu_base + k_ids[:, None] * stride_qm + offs_d[None, :] * stride_qk
-
-        k = tl.load(k_ptrs, mask=k_ids[:, None] < N, other=0.0)
-        v_k = tl.load(v_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
-        qu_k = tl.load(qu_k_ptrs, mask=k_ids[:, None] < N, other=0.0)
-        valid_k = k_ids < N
-
-        # base qk scores
-        qk = tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)))  # [BM, BK]
-
-        # accumulate Su over all j-blocks
-        su_acc = tl.zeros_like(qk)
-
-        for start_j in range(0, N, BLOCK_N):
-            j_ids = start_j + offs_n
-            v_j_ptrs = vu_base + j_ids[:, None] * stride_vn + offs_d[None, :] * stride_vk
-            ku_j_ptrs = ku_base + j_ids[:, None] * stride_kn + offs_d[None, :] * stride_kk
-
-            v_j = tl.load(v_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
-            ku_j = tl.load(ku_j_ptrs, mask=j_ids[:, None] < N, other=0.0)
-            valid_j = j_ids < N
-
-            # t1(i,j) = q_i · vu_j (masked j <= i)
-            t1 = tl.dot(q.to(tl.float32), tl.trans(v_j.to(tl.float32)))  # [BM, BJ]
-            mask_t1 = (j_ids[None, :] <= offs_m[:, None]) & valid_j[None, :]
-            t1 = tl.where(mask_t1, t1, 0.0)
-
-            # la(k,j) = sigmoid(qu_k · ku_j) (masked j > k)
-            la = tl.dot(qu_k.to(tl.float32), tl.trans(ku_j.to(tl.float32)))  # [BK, BJ]
-            la = tl.sigmoid(la)
-            mask_la = (j_ids[None, :] > k_ids[:, None]) & valid_j[None, :] & valid_k[:, None]
-            la = tl.where(mask_la, la, 0.0)
-
-            # accumulate su over j: [BM,BK]
-            su_acc += tl.dot(t1, tl.trans(la))
-
-        su_silu = su_acc * tl.sigmoid(su_acc)
-        scores = qk - su_silu
-
-        causal_mask = offs_m[:, None] >= k_ids[None, :]
-        scores = tl.where(causal_mask, scores, -float("inf"))
-
-        # online softmax update for this block
-        m_ij = tl.max(scores, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        p_blk = tl.exp(scores - m_i_new[:, None])
-        l_ij = tl.sum(p_blk, axis=1)
-        alpha = tl.exp(m_i - m_i_new)
-        l_i = l_i * alpha + l_ij
-        m_i = m_i_new
-
-    # Pass 2: compute grads using p with global m_i and l_i
+    # Single pass: compute grads using stored LSE
     dq_acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     for start_k in range(0, N, BLOCK_N):
@@ -354,13 +302,13 @@ def _castle_attn_bwd_kernel(
 
             su_acc += tl.dot(t1, tl.trans(la))
 
-        # compute scores and p using global m_i and l_i
+        # compute scores and p using stored LSE
         su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
         causal_mask = offs_m[:, None] >= k_ids[None, :]
         scores = tl.where(causal_mask, scores, -float("inf"))
 
-        p = tl.exp(scores - m_i[:, None]) / l_i[:, None]
+        p = tl.exp(scores - lse_i[:, None])
 
         # dp = do @ v_k^T
         dp = tl.dot(do.to(tl.float32), tl.trans(v_k.to(tl.float32)))  # [BM, BK]
@@ -477,7 +425,12 @@ class CastleAttentionFunction(Function):
 
         # Allocate output in half precision
         o = torch.empty_like(q)
-        
+
+        # Allocate LSE tensor for storing log-sum-exp values
+        from math import ceil
+        seqlen_q_rounded = ceil(seq_len / 128) * 128
+        lse = torch.empty((batch, heads, seqlen_q_rounded), device=device, dtype=torch.float32)
+
         # Configure grid
         def cdiv(a, b):
             return (a + b - 1) // b
@@ -499,12 +452,12 @@ class CastleAttentionFunction(Function):
 
         # Launch kernel
         _castle_attn_fwd_kernel[grid](
-            q, k, v, qu, ku, vu, o,
+            q, k, v, qu, ku, vu, o, lse,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            batch, heads, seq_len, seq_len,
+            batch, heads, seq_len, seq_len, seqlen_q_rounded,
             BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_DMODEL=dim_head,
         )
 
@@ -512,17 +465,19 @@ class CastleAttentionFunction(Function):
         o = o.to(orig_dtype)
 
         # Save for backward (keep in half precision to save memory)
-        ctx.save_for_backward(q, k, v, qu, ku, vu, o.half())
+        ctx.save_for_backward(q, k, v, qu, ku, vu, o.half(), lse)
         ctx.scale = scale
         ctx.orig_dtype = orig_dtype
+        ctx.seqlen_q_rounded = seqlen_q_rounded
 
         return o
     
     @staticmethod
     def backward(ctx, do):
-        q, k, v, qu, ku, vu, o = ctx.saved_tensors
+        q, k, v, qu, ku, vu, o, lse = ctx.saved_tensors
         scale = ctx.scale
         orig_dtype = ctx.orig_dtype
+        seqlen_q_rounded = ctx.seqlen_q_rounded
 
         # Convert gradient input to half precision
         do = do.half()
@@ -582,13 +537,13 @@ class CastleAttentionFunction(Function):
 
         _castle_attn_bwd_kernel[grid](
             q, k, v, qu, ku, vu,
-            do, delta,
+            do, delta, lse,
             dq, dk, dv, dqu, dku, dvu,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            batch, heads, seq_len, seq_len,
+            batch, heads, seq_len, seq_len, seqlen_q_rounded,
             BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_DMODEL=dim_head,
         )
 

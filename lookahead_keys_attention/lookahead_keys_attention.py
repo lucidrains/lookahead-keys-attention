@@ -111,11 +111,6 @@ class Castle(Module):
             
             qc, kc, qu, ku, vu = map(partial(self.rotary_emb.rotate_queries_or_keys, offset = offset), (qc, kc, qu, ku, vu))
 
-        # scaled queries
-
-        qu_scaled = qu * scale
-        qc_scaled = qc * scale
-
         # handle single token vs multiple ones differently
 
         if not is_inference:
@@ -124,7 +119,7 @@ class Castle(Module):
             # Use Triton implementation if enabled and tensors are on CUDA
             if self.use_triton and qc.is_cuda:
                 # Use Triton path - much more efficient for parallel training
-                out = castle_attention_triton(qc_scaled, kc, vc, qu_scaled, ku, vu, 1.0)
+                out = castle_attention_triton(qc, kc, vc, qu, ku, vu, scale)
 
                 if return_next_cache:
                     # Calculate lookahead keys for cache
@@ -135,6 +130,11 @@ class Castle(Module):
                     U = einsum('...ij, ...jd -> ...id', lookahead_attn, vu)
                     next_cache = Cache(U, qu, kc, vc)
             else:
+                # scaled queries
+
+                qu_scaled = qu * scale
+                qc_scaled = qc * scale
+
                 # Use reference PyTorch implementation
                 mask_shape = (seq_len, seq_len)
 
@@ -165,10 +165,16 @@ class Castle(Module):
                     next_cache = Cache(U, qu, kc, vc)
 
         else:
+
             # Inference mode (single token) - always use reference implementation
             if not exists(cache):
                 empty_tensor = qu[..., 0:0, :] # (batch, heads, 0, dim_head)
                 cache = (empty_tensor,) * 4
+
+            # scaled queries
+
+            qu_scaled = qu * scale
+            qc_scaled = qc * scale
 
             U_prev, qu_cache, kc_cache, vc_cache = cache
 
