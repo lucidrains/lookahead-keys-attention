@@ -386,9 +386,6 @@ def _castle_attn_bwd_kernel(
     dq_ptrs = dQ_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     tl.store(dq_ptrs, dq_acc, mask=offs_m[:, None] < M)
 
-
-
-
 # Custom autograd function with Triton
 class CastleAttentionFunction(Function):
     @staticmethod
