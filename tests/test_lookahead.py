@@ -220,3 +220,63 @@ def test_castle_causality_triton(
     # Check causality: first half of full output should match half output
     assert torch.allclose(output_full[:, :half_len, :], output_half, atol = 1e-3), \
         "Causality violated: future tokens influenced past tokens"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
+@torch.no_grad()
+@param('prenorm', (False, True))
+def test_castle_triton_parallel_vs_sequential(
+    prenorm
+):
+    """Test that Triton implementation produces same results for parallel vs sequential processing
+
+    Note: This test only works without rotary embeddings, since rotary embeddings
+    intentionally behave differently between parallel and sequential processing due to
+    position offset handling in the cache.
+    """
+    rotary = False  # Must be False for this test to be meaningful
+    batch_size = 2
+    seq_len = 16
+    dim = 32
+    dim_head = 16
+    heads = 2
+    split = 8
+
+    # Create Triton model
+    model = Castle(
+        dim = dim,
+        dim_head = dim_head,
+        heads = heads,
+        prenorm = prenorm,
+        rotary_emb = rotary,
+        use_triton = True
+    ).cuda()
+
+    model.eval()
+
+    input_sequence = torch.randn(batch_size, seq_len, dim).cuda()
+
+    # Parallel processing of first part, then sequential for rest
+    parallel_part_output, cache = model(input_sequence[:, :split, :], return_next_cache = True)
+
+    recurrent_outputs = []
+    for t in range(split, seq_len):
+        x_t = input_sequence[:, t:t+1, :]
+        output_t, cache = model(x_t, cache = cache, return_next_cache = True)
+        recurrent_outputs.append(output_t)
+
+    recurrent_outputs = torch.cat(recurrent_outputs, dim = 1)
+    mixed_output = torch.cat((parallel_part_output, recurrent_outputs), dim = 1)
+
+    # Full parallel processing
+    parallel_output = model(input_sequence)
+
+    assert mixed_output.shape == parallel_output.shape
+
+    # Check for differences and print details if they don't match
+    max_diff = (mixed_output - parallel_output).abs().max().item()
+    print(f"Maximum difference between parallel and sequential: {max_diff:.2e}")
+
+    # Use more relaxed tolerance due to numerical precision differences
+    assert torch.allclose(mixed_output, parallel_output, atol = 1e-3), \
+        f"Triton parallel vs sequential processing results do not match (max diff: {max_diff:.2e})"

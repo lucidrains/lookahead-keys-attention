@@ -119,16 +119,15 @@ class Castle(Module):
             # Use Triton implementation if enabled and tensors are on CUDA
             if self.use_triton and qc.is_cuda:
                 # Use Triton path - much more efficient for parallel training
-                out = castle_attention_triton(qc, kc, vc, qu, ku, vu, scale)
+                result = castle_attention_triton(qc, kc, vc, qu, ku, vu, scale, return_next_cache)
 
                 if return_next_cache:
-                    # Calculate lookahead keys for cache
-                    mask_shape = (seq_len, seq_len)
-                    causal_mask = torch.ones(mask_shape, device = device, dtype = torch.bool).triu(1)
-                    lookahead_attn = einsum('...id, ...jd -> ...ij', qu_scaled, ku).sigmoid()
-                    lookahead_attn = lookahead_attn.masked_fill(~causal_mask, 0.)
-                    U = einsum('...ij, ...jd -> ...id', lookahead_attn, vu)
+                    # Triton kernel returns tuple (out, U) when return_U_for_cache=True
+                    out, U = result
                     next_cache = Cache(U, qu, kc, vc)
+                else:
+                    # Triton kernel returns just out when return_U_for_cache=False
+                    out = result
             else:
                 # scaled queries
 

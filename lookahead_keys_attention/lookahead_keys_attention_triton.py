@@ -19,12 +19,14 @@ from einops.layers.torch import Rearrange
 @triton.jit
 def _castle_attn_fwd_kernel(
     Q, K, V, QU, KU, VU,
-    Out, Lse,
+    Out, Lse, U_out,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_ok,
+    stride_uz, stride_uh, stride_um, stride_uk,
     Z, H, M, N, seqlen_q_rounded,
+    COMPUTE_U: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -55,10 +57,16 @@ def _castle_attn_fwd_kernel(
     ku_base = KU + z * stride_kz + h * stride_kh
     vu_base = VU + z * stride_vz + h * stride_vh
     o_base = Out + z * stride_oz + h * stride_oh
+    u_base = U_out + z * stride_uz + h * stride_uh if COMPUTE_U else 0
 
     # load q once for the block of queries
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q = tl.load(q_ptrs, mask=offs_m[:, None] < M, other=0.0)
+
+    # load qu and initialize U accumulator if computing U
+    qu_ptrs = qu_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    qu = tl.load(qu_ptrs, mask=offs_m[:, None] < M, other=0.0) if COMPUTE_U else tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    u_acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     # initialize accumulators for online softmax
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -114,6 +122,19 @@ def _castle_attn_fwd_kernel(
             # accumulate su: t1 @ la^T over j dimension -> [BM, BK]
             su_acc += tl.dot(t1, tl.trans(la))
 
+            # compute U contribution during first k-block iteration to reuse ku_j and v_j loads
+            if COMPUTE_U and start_k == 0:
+                # compute lookahead attention: sigmoid(qu @ ku_j^T) for query positions
+                lookahead_scores = tl.dot(qu.to(tl.float32), tl.trans(ku_j.to(tl.float32)))  # [BM, BJ]
+                lookahead_attn = tl.sigmoid(lookahead_scores)
+
+                # apply causal mask: keep only j > i
+                causal_mask = j_ids[None, :] > offs_m[:, None]
+                lookahead_attn = tl.where(causal_mask & valid_j[None, :], lookahead_attn, 0.0)
+
+                # accumulate U: lookahead_attn @ vu_j (v_j is actually vu_j)
+                u_acc += tl.dot(lookahead_attn, v_j.to(tl.float32))
+
         # combine scores for this k-block
         su_silu = su_acc * tl.sigmoid(su_acc)
         scores = qk - su_silu
@@ -140,9 +161,14 @@ def _castle_attn_fwd_kernel(
     lse_ptrs = Lse + pid_hz * seqlen_q_rounded + offs_m
     tl.store(lse_ptrs, lse_i, mask=offs_m < M)
 
-    # store
+    # store main output
     o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(o_ptrs, out, mask=offs_m[:, None] < M)
+
+    # store U if computed
+    if COMPUTE_U:
+        u_ptrs = u_base + offs_m[:, None] * stride_um + offs_d[None, :] * stride_uk
+        tl.store(u_ptrs, u_acc, mask=offs_m[:, None] < M)
 
 
 # Preprocess kernel for backward pass (computes delta = do * o)
@@ -389,7 +415,7 @@ def _castle_attn_bwd_kernel(
 # Custom autograd function with Triton
 class CastleAttentionFunction(Function):
     @staticmethod
-    def forward(ctx, q, k, v, qu, ku, vu, scale):
+    def forward(ctx, q, k, v, qu, ku, vu, scale, return_U_for_cache):
         """
         Forward pass of Castle attention
 
@@ -397,6 +423,7 @@ class CastleAttentionFunction(Function):
             q, k, v: Standard attention tensors [batch, heads, seq_len, dim_head]
             qu, ku, vu: Lookahead attention tensors [batch, heads, seq_len, dim_head]
             scale: Scaling factor for queries
+            return_U_for_cache: If True, also compute and return U for caching
         """
         batch, heads, seq_len, dim_head = q.shape
 
@@ -418,6 +445,9 @@ class CastleAttentionFunction(Function):
 
         # Allocate output in half precision
         o = torch.empty_like(q)
+
+        # Allocate U tensor if needed
+        U = torch.empty_like(qu) if return_U_for_cache else torch.empty((1, 1, 1, 1), device=device, dtype=qu.dtype)
 
         # Allocate LSE tensor for storing log-sum-exp values
         from math import ceil
@@ -445,17 +475,25 @@ class CastleAttentionFunction(Function):
 
         # Launch kernel
         _castle_attn_fwd_kernel[grid](
-            q, k, v, qu, ku, vu, o, lse,
+            q, k, v, qu, ku, vu, o, lse, U,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            U.stride(0), U.stride(1), U.stride(2), U.stride(3),
             batch, heads, seq_len, seq_len, seqlen_q_rounded,
+            COMPUTE_U=return_U_for_cache,
             BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_DMODEL=dim_head,
         )
 
         # Convert output back to original dtype
         o = o.to(orig_dtype)
+
+        # Convert U back to original dtype if computed
+        if return_U_for_cache:
+            U = U.to(orig_dtype)
+        else:
+            U = None
 
         # Save for backward (keep in half precision to save memory)
         ctx.save_for_backward(q, k, v, qu, ku, vu, o.half(), lse)
@@ -463,10 +501,14 @@ class CastleAttentionFunction(Function):
         ctx.orig_dtype = orig_dtype
         ctx.seqlen_q_rounded = seqlen_q_rounded
 
-        return o
+        return (o, U) if return_U_for_cache else o
     
     @staticmethod
-    def backward(ctx, do):
+    def backward(ctx, do, dU=None):
+        # Assert that U never receives gradients
+        if dU is not None:
+            assert torch.allclose(dU, torch.zeros_like(dU)), "U should never receive gradients - it's only for caching"
+
         q, k, v, qu, ku, vu, o, lse = ctx.saved_tensors
         scale = ctx.scale
         orig_dtype = ctx.orig_dtype
@@ -552,7 +594,7 @@ class CastleAttentionFunction(Function):
         dku = dku.to(orig_dtype)
         dvu = dvu.to(orig_dtype)
 
-        return dq, dk, dv, dqu, dku, dvu, None
+        return dq, dk, dv, dqu, dku, dvu, None, None
 
 # Apply function
 castle_attention_triton = CastleAttentionFunction.apply
