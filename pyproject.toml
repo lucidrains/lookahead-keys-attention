@@ -1,6 +1,6 @@
 [project]
 name = "lookahead-keys-attention"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lookahead Keys Attention"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
