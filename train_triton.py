@@ -121,17 +121,16 @@ class CastleLM(Module):
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
-        # Initialize cache with prompt
-        logits, cache = self.forward(out, return_loss=False, return_next_cache=True)
+        # sampled output and cache
+        out = prompt
+        cache = None
 
         for i in range(sample_num_times):
-            if i == 0:
-                # Use logits from prompt forward pass
-                logits_to_use = logits[:, -1]
-            else:
-                # Forward single token with cache
-                logits, cache = self.forward(out[:, -1:], return_loss=False, cache=cache, return_next_cache=True)
-                logits_to_use = logits[:, -1]
+
+            inp = out if not exists(cache) else out[:, -1:] # last token if cache passed in
+
+            logits, cache = self.forward(inp, return_loss=False, cache=cache, return_next_cache=True)
+            logits_to_use = logits[:, -1]
 
             logits_to_use = top_k(logits_to_use, thres=filter_thres)
             sample = gumbel_sample(logits_to_use, temperature=temperature, dim=-1)
