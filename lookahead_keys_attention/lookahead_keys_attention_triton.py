@@ -425,6 +425,8 @@ class CastleAttentionFunction(Function):
             scale: Scaling factor for queries
             return_U_for_cache: If True, also compute and return U for caching
         """
+        q, k, v, qu, ku, vu = tuple(t.contiguous() for t in (q, k, v, qu, ku, vu))
+
         batch, heads, seq_len, dim_head = q.shape
 
         # Store original dtype and device
@@ -505,8 +507,11 @@ class CastleAttentionFunction(Function):
     
     @staticmethod
     def backward(ctx, do, dU=None):
+        do = do.contiguous()
+
         # Assert that U never receives gradients
         if dU is not None:
+            dU = dU.contiguous()
             assert torch.allclose(dU, torch.zeros_like(dU)), "U should never receive gradients - it's only for caching"
 
         q, k, v, qu, ku, vu, o, lse = ctx.saved_tensors

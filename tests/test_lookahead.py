@@ -66,7 +66,7 @@ def test_castle_reference_implementation(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'no cuda')
 @param('prenorm', (False, True))
-@param('rotary', (False, False))
+@param('rotary', (False, True))
 def test_castle_triton_vs_reference(
     prenorm,
     rotary
