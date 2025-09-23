@@ -498,7 +498,7 @@ class CastleAttentionFunction(Function):
             U = None
 
         # Save for backward (keep in half precision to save memory)
-        ctx.save_for_backward(q, k, v, qu, ku, vu, o.half(), lse)
+        ctx.save_for_backward(q, k, v, qu, ku, vu, o, lse)
         ctx.scale = scale
         ctx.orig_dtype = orig_dtype
         ctx.seqlen_q_rounded = seqlen_q_rounded
