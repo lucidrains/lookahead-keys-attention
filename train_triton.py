@@ -1,9 +1,11 @@
+# /// script
 # requires-python = ">=3.8"
 # dependencies = [
 #     "tqdm",
 #     "numpy",
 #     "lookahead-keys-attention",
 # ]
+# ///
 
 import math
 import gzip
