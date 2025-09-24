@@ -46,6 +46,16 @@ for i in range(seq_len):
     output, cache = model(token, cache=cache, return_next_cache=True)
 ```
 
+## Char level Enwik8
+
+Make sure `uv` is installed (`pip install uv`)
+
+Then
+
+```shell
+$ uv run train_triton.py
+```
+
 ## Citations
 
 ```bibtex

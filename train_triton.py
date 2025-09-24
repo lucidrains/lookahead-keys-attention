@@ -1,12 +1,9 @@
-#!/usr/bin/env uv run
-# /// script
 # requires-python = ">=3.8"
 # dependencies = [
 #     "tqdm",
 #     "numpy",
 #     "lookahead-keys-attention",
 # ]
-# ///
 
 import math
 import gzip
