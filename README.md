@@ -16,34 +16,33 @@ pip install lookahead-keys-attention
 import torch
 from lookahead_keys_attention import Castle
 
-# Initialize the Castle attention module
+# lookahead keys attention
+
 model = Castle(
-    dim=512,           # input dimension
-    heads=8,           # number of attention heads
-    dim_head=64,       # dimension per head
-    use_triton=None    # auto-detect CUDA for Triton optimization
-)
+    dim = 512,           # input dimension
+    heads = 8,           # number of attention heads
+    dim_head = 64,       # dimension per head
+    use_triton = None    # auto set to if cuda and triton is available, but can be forced
+).cuda()
 
-# Example with CUDA sequence
-batch_size = 2
-seq_len = 128
-dim = 512
+seq = torch.randn(2, 128, 512).cuda()
 
-# Move to CUDA if available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
+# parallel
 
-# Input sequence
-x = torch.randn(batch_size, seq_len, dim).to(device)
+parallel_output = model(seq)  # (batch_size, seq_len, dim)
 
-# Forward pass
-output = model(x)  # Shape: [batch_size, seq_len, dim]
+# sequential
 
-# For inference with caching (single token generation)
 cache = None
-for i in range(seq_len):
-    token = x[:, i:i+1, :]  # Single token
-    output, cache = model(token, cache=cache, return_next_cache=True)
+outputs = []
+
+for token in seq.unbind(dim = 1):
+    output, cache = model(token, cache = cache, return_next_cache = True)
+    outputs.append(output)
+
+seq_output = torch.cat(outputs, dim = 1)
+
+assert torch.allclose(parallel_output, seq_output, atol = 1e-3)
 ```
 
 ## Char level Enwik8
