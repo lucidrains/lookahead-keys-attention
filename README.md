@@ -1,6 +1,6 @@
 <img src="./fig3.png" width="400px"></img>
 
-## Lookahead Keys Attention (wip)
+## Lookahead Keys Attention
 
 Causal Attention with [Lookahead Keys](https://arxiv.org/abs/2509.07301)
 
